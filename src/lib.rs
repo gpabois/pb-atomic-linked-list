@@ -1,8 +1,13 @@
 use std::{marker::PhantomData, ptr::NonNull, sync::{atomic::{AtomicBool, AtomicPtr, AtomicUsize}, Arc}};
 
 /// An atomic insert-only linked-list.
-#[derive(Clone)]
 pub struct AtomicLinkedList<T>(Arc<InnerAtomicLinkedList<T>>);
+
+impl<T> Clone for AtomicLinkedList<T> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
 
 impl<T> AtomicLinkedList<T> {
     /// Creates a new linked-list

@@ -1,0 +1,10 @@
+[package]
+name = "pb-atomic-linked-list"
+version = "0.1.0"
+edition = "2021"
+description = "An atomic insert-only linked list"
+license-file = "LICENSE.txt"
+categories = ["memory-management"]
+homepage = "https://github.com/gpabois/rs-pb-atomic-linked-list"
+
+[dependencies]

@@ -59,12 +59,25 @@ impl<T> prelude::AtomicLinkedList<T> for AtomicLinkedList<T> {
     fn borrow<'a>(&'a self, index: usize) -> Option<&T> where T: 'a {
         self.iter().nth(index)
     }
+    
 }
 
 impl<T> AtomicLinkedList<T> {
     /// Creates a new linked-list
     pub fn new() -> Self {
         Self(Arc::new(InnerAtomicLinkedList::new()))
+    }
+
+    /// Get the pointer to the data in the linked list.
+    /// 
+    /// This can be used to cache data address for faster retrieval.
+    /// 
+    /// # Unsafe
+    /// Obviously because it overrides all rust-based common sense.
+    pub unsafe fn get_raw_data_ptr(&self, index: usize) -> Option<NonNull<T>> {
+        AtomicLinkIter::new(&self.0).nth(index).map(|mut ptr| {
+            NonNull::new(std::ptr::from_mut(&mut ptr.as_mut().data)).unwrap()
+        })
     }
 
     /// Get a pointer to an atomic link.
@@ -212,6 +225,7 @@ impl<T> InnerAtomicLinkedList<T> {
         }
     }
 
+    /// Removes the front item and returns it.
     pub fn remove_front(&self) -> Option<T> {
         unsafe {
             let mut old_head = self.head.load(std::sync::atomic::Ordering::Relaxed);
@@ -260,6 +274,7 @@ impl<T> AtomicLink<T> {
         let lnk = Self::new(index, data);
         NonNull::new(Box::into_raw(Box::new(lnk))).unwrap()
     }
+
 }
 
 #[cfg(test)]

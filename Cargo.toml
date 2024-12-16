@@ -1,6 +1,6 @@
 [package]
 name = "pb-atomic-linked-list"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 description = "An atomic insert-only linked list"
 license-file = "LICENSE.txt"

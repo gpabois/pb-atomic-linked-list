@@ -216,7 +216,14 @@ impl<T> InnerAtomicLinkedList<T> {
         unsafe {
             let mut old_head = self.head.load(std::sync::atomic::Ordering::Relaxed);
 
-            while let Err(next) = self.head.compare_exchange(old_head, old_head.as_ref().unwrap().next.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::Relaxed) {
+            if old_head.is_null() {
+                return None
+            }
+
+            while let Err(next) = self.head.compare_exchange(
+                old_head, 
+                old_head.as_ref().unwrap().next.load(Ordering::Relaxed), 
+                Ordering::SeqCst, Ordering::Relaxed) {
                 old_head = next;
 
                 if old_head.is_null() {

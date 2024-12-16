@@ -1,4 +1,38 @@
-use std::{marker::PhantomData, ptr::NonNull, sync::{atomic::{AtomicBool, AtomicPtr, AtomicUsize}, Arc}};
+use std::{alloc::{dealloc, Layout}, cell::UnsafeCell, collections::HashMap, marker::PhantomData, mem::MaybeUninit, ptr::NonNull, sync::{atomic::{AtomicPtr, Ordering}, Arc}};
+
+pub mod prelude {
+    pub trait AtomicLinkedList<T> {
+        /// Insert a new data within the linked list.
+        /// Returns the index of the data in the list.
+        fn insert(&mut self, data: T) -> usize;
+        
+        /// Iterate over entries references in the linked list.
+        fn iter<'a>(&'a self) -> impl Iterator<Item=&T> where T: 'a;
+
+        /// Borrow an element in the linked-list
+        fn borrow<'a>(&'a self, index: usize) -> Option<&T> where T: 'a;
+    }
+}
+
+
+/// An atomic queue based on a linked-list
+pub struct AtomicQueue<T>(Arc<InnerAtomicLinkedList<T>>);
+
+impl<T> AtomicQueue<T> {
+    pub fn new() -> Self {
+        Self(Arc::new(InnerAtomicLinkedList::new()))
+    }
+
+    /// Enqueue an element
+    pub fn enqueue(&mut self, data: T) {
+        self.0.insert(data);
+    }
+
+    /// Dequeue an element
+    pub fn dequeue(&mut self) -> Option<T> {
+        self.0.remove_front()
+    }
+}
 
 /// An atomic insert-only linked-list.
 pub struct AtomicLinkedList<T>(Arc<InnerAtomicLinkedList<T>>);
@@ -9,28 +43,87 @@ impl<T> Clone for AtomicLinkedList<T> {
     }
 }
 
+impl<T> prelude::AtomicLinkedList<T> for AtomicLinkedList<T> {
+    /// Insert a new data within the linked list.
+    /// Returns the index of the data in the list.
+    fn insert(&mut self, data: T) -> usize {
+        self.0.insert(data)
+    }
+
+    /// Iterate over entries references in the linked list.
+    fn iter<'a>(&'a self) -> impl Iterator<Item=&T> where T: 'a {
+        AtomicLinkIter::new(&self.0).map(|link| unsafe {&link.as_ref().data})
+    }
+
+    /// Borrow an element in the linked-list
+    fn borrow<'a>(&'a self, index: usize) -> Option<&T> where T: 'a {
+        self.iter().nth(index)
+    }
+}
+
 impl<T> AtomicLinkedList<T> {
     /// Creates a new linked-list
     pub fn new() -> Self {
         Self(Arc::new(InnerAtomicLinkedList::new()))
     }
 
+    /// Get a pointer to an atomic link.
+    unsafe fn get_link_ptr(&self, index: usize) -> Option<NonNull<AtomicLink<T>>> {
+        AtomicLinkIter::new(&self.0).nth(index)
+    }
+}
+
+/// A cached atomic linked list for faster access
+pub struct CachedAtomicLinkedList<T> {
+    cache: UnsafeCell<HashMap<usize, NonNull<AtomicLink<T>>>>,
+    inner: AtomicLinkedList<T>
+}
+
+impl<T> CachedAtomicLinkedList<T> {
+    pub fn new() -> Self {
+        Self {
+            cache: UnsafeCell::new(HashMap::default()),
+            inner: AtomicLinkedList::new()
+        }
+    }
+}
+
+impl<T> From<AtomicLinkedList<T>> for CachedAtomicLinkedList<T> {
+    fn from(inner: AtomicLinkedList<T>) -> Self {
+       Self {
+            cache: UnsafeCell::new(HashMap::default()),
+            inner
+       }
+    }
+}
+
+impl<T> prelude::AtomicLinkedList<T> for CachedAtomicLinkedList<T> {
     /// Insert a new data within the linked list.
     /// Returns the index of the data in the list.
-    pub fn insert(&self, data: T) -> usize {
-        self.0.insert(data)
+    fn insert(&mut self, data: T) -> usize {
+        self.inner.insert(data)
     }
 
     /// Iterate over entries references in the linked list.
-    pub fn iter(&self) -> impl Iterator<Item=&T> {
-        AtomicLinkIter::new(&self.0).map(|link| unsafe {&link.as_ref().data})
+    fn iter<'a>(&'a self) -> impl Iterator<Item=&T> where T: 'a {
+        self.inner.iter()
     }
 
     /// Borrow an element in the linked-list
-    pub fn borrow(&self, index: usize) -> Option<&T> {
-        self.iter().nth(index)
+    fn borrow<'a>(&'a self, index: usize) -> Option<&T> where T: 'a {
+        unsafe {
+            if let Some(ptr) = self.cache.get().as_mut().unwrap().get(&index) {
+                Some(&ptr.as_ref().data)
+            } else if let Some(ptr) =  self.inner.get_link_ptr(index) {
+                self.cache.get().as_mut().unwrap().insert(index, ptr);
+                Some(&ptr.as_ref().data)
+            } else {
+                None
+            }
+        }
     }
 }
+
 
 struct AtomicLinkIter<'a, T> {
     _phantom: std::marker::PhantomData<&'a ()>,
@@ -66,8 +159,6 @@ impl<'a, T> Iterator for AtomicLinkIter<'a, T> {
 
 /// Atomic insert-only linked list
 struct InnerAtomicLinkedList<T> {
-    raw_lock: AtomicBool,
-    counter: AtomicUsize,
     head: AtomicPtr<AtomicLink<T>>,
     tail: AtomicPtr<AtomicLink<T>>
 }
@@ -84,53 +175,61 @@ impl<T> Drop for InnerAtomicLinkedList<T> {
 impl<T> InnerAtomicLinkedList<T> {
     fn new() -> Self {
         Self {
-            raw_lock: AtomicBool::new(false),
-            counter: AtomicUsize::new(0),
             head: AtomicPtr::default(),
             tail: AtomicPtr::default()
         }
     }
 }
 
-struct AtomicSpinlock<'a>(&'a AtomicBool);
-
-impl<'a> AtomicSpinlock<'a> {
-    pub fn acquire(atomic: &'a AtomicBool) -> Self {
-        while !atomic.swap(true, std::sync::atomic::Ordering::SeqCst) {}
-        Self(atomic)
-    }
-}
-
-impl Drop for AtomicSpinlock<'_> {
-    fn drop(&mut self) {
-        self.0.swap(false, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
 impl<T> InnerAtomicLinkedList<T> {
     /// Insert an element in the linked-list
     pub fn insert(&self, data: T) -> usize {
-        let _lock = AtomicSpinlock::acquire(&self.raw_lock);
-
-        let tail = self.tail.load(std::sync::atomic::Ordering::Acquire);
-
-        let mut new_tail = NonNull::new(Box::into_raw(Box::new(
-            AtomicLink::new(
-                self.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                data
-            )
-        ))).unwrap();
-
         unsafe {
-            if tail.is_null() {
-                self.head.store(new_tail.as_mut(), std::sync::atomic::Ordering::Relaxed);
-                self.tail.store(new_tail.as_mut(), std::sync::atomic::Ordering::Release);
-            } else {
-                tail.as_mut().unwrap().next.store(new_tail.as_mut(), std::sync::atomic::Ordering::Relaxed);
-                self.tail.store(new_tail.as_mut(), std::sync::atomic::Ordering::Release);
+            let new_tail = AtomicLink::alloc_and_init(0, data).as_ptr();
+            let null_ptr = std::ptr::null_mut::<AtomicLink<T>>();
+
+            if let Ok(_) = self.tail.compare_exchange(null_ptr, new_tail, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::Relaxed) {
+                self.head.store(new_tail, std::sync::atomic::Ordering::Relaxed);
+                return 0;
             }
 
-            return new_tail.as_ref().index
+            let mut old_tail = self.tail.load(std::sync::atomic::Ordering::Relaxed);
+            
+            while let Err(lnk) = old_tail.as_ref().unwrap().next.compare_exchange(null_ptr, new_tail, Ordering::SeqCst, std::sync::atomic::Ordering::Relaxed) {
+                old_tail = lnk;
+            }
+            
+            new_tail.as_mut().unwrap().index = old_tail.as_ref().unwrap().index + 1;
+        
+            let _ = self.tail.compare_exchange(
+                old_tail, 
+                new_tail, 
+                std::sync::atomic::Ordering::SeqCst, 
+                std::sync::atomic::Ordering::Relaxed
+            );
+
+            return new_tail.as_ref().unwrap().index
+        }
+    }
+
+    pub fn remove_front(&self) -> Option<T> {
+        unsafe {
+            let mut old_head = self.head.load(std::sync::atomic::Ordering::Relaxed);
+
+            while let Err(next) = self.head.compare_exchange(old_head, old_head.as_ref().unwrap().next.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::Relaxed) {
+                old_head = next;
+
+                if old_head.is_null() {
+                    return None
+                }
+            }
+    
+            let mut value = MaybeUninit::<T>::uninit().assume_init();
+            let in_link_value = std::ptr::from_ref(&old_head.as_ref().unwrap().data);
+            std::ptr::copy(in_link_value, std::ptr::from_mut(&mut value), 1);    
+            dealloc(old_head.cast::<u8>(), Layout::new::<AtomicLink<T>>());
+            
+            Some(value)
         }
     }
 }
@@ -138,7 +237,7 @@ impl<T> InnerAtomicLinkedList<T> {
 struct AtomicLink<T> {
     index: usize,
     data: T,
-    next: AtomicPtr<AtomicLink<T>>
+    pub next: AtomicPtr<AtomicLink<T>>
 }
 
 impl<T> AtomicLink<T> {
@@ -149,20 +248,34 @@ impl<T> AtomicLink<T> {
             next: AtomicPtr::default()
         }
     }
+
+    unsafe fn alloc_and_init(index: usize, data: T) -> NonNull<Self> {
+        let lnk = Self::new(index, data);
+        NonNull::new(Box::into_raw(Box::new(lnk))).unwrap()
+    }
 }
 
 #[cfg(test)]
 mod test {
     use std::{collections::HashSet, thread};
 
-    use crate::AtomicLinkedList;
+    use crate::{AtomicLinkedList, AtomicQueue, prelude::AtomicLinkedList as _};
+
+    #[test]
+    fn simple_enqueue_dequeue() {
+        let mut ll = AtomicQueue::<u32>::new();
+        ll.enqueue(30);
+        ll.enqueue(31);
+        assert_eq!(ll.dequeue().unwrap(), 30);
+        assert_eq!(ll.dequeue().unwrap(), 31);
+    }
 
     #[test]
     fn insert_from_two_threads() {
         let ll = AtomicLinkedList::<u32>::new();
 
-        let ll_1 = ll.clone();
-        let ll_2 = ll.clone();
+        let mut ll_1 = ll.clone();
+        let mut ll_2 = ll.clone();
         
         let join_1 = thread::spawn(move || {
             for i in 0..=100 {

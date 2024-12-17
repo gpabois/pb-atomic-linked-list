@@ -46,7 +46,10 @@ impl<T> prelude::AtomicLinkedList<T> for AtomicLinkedList<T> {
     /// Insert a new data within the linked list.
     /// Returns the index of the data in the list.
     fn insert(&mut self, data: T) -> usize {
-        self.0.insert(data)
+        unsafe {
+            let (index, _) = self.0.insert_and_returns_ptr(data);
+            index
+        }
     }
 
     /// Iterate over entries references in the linked list.
@@ -65,6 +68,11 @@ impl<T> AtomicLinkedList<T> {
     /// Creates a new linked-list
     pub fn new() -> Self {
         Self(Arc::new(InnerAtomicLinkedList::new()))
+    }
+
+    /// Insert the value in the list and returns the pair (addr, ptr) 
+    pub unsafe fn insert_and_returns_ptr(&self, data: T) -> (usize, NonNull<T>) {
+        self.0.insert_and_returns_ptr(data)
     }
 
     /// Get the pointer to the data in the linked list.
@@ -205,34 +213,38 @@ impl<T> InnerAtomicLinkedList<T> {
 }
 
 impl<T> InnerAtomicLinkedList<T> {
+    fn insert(&self, data: T) -> usize {
+        let (addr, _) = unsafe {self.insert_and_returns_ptr(data)};
+        addr
+    }
     /// Insert an element in the linked-list
-    pub fn insert(&self, data: T) -> usize {
-        unsafe {
-            let new_tail = AtomicLink::alloc_and_init(0, data).as_ptr();
-            let null_ptr = std::ptr::null_mut::<AtomicLink<T>>();
+    unsafe fn insert_and_returns_ptr(&self, data: T) -> (usize, NonNull<T>) {
+        let new_tail = AtomicLink::alloc_and_init(0, data).as_ptr();
+        let entry_ptr = NonNull::new(std::ptr::from_mut(&mut new_tail.as_mut().unwrap().data)).unwrap();
+        let null_ptr = std::ptr::null_mut::<AtomicLink<T>>();
 
-            if let Ok(_) = self.tail.compare_exchange(null_ptr, new_tail, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::Relaxed) {
-                self.head.store(new_tail, std::sync::atomic::Ordering::Relaxed);
-                return 0;
-            }
-
-            let mut old_tail = self.tail.load(std::sync::atomic::Ordering::Relaxed);
-            
-            while let Err(lnk) = old_tail.as_ref().unwrap().next.compare_exchange(null_ptr, new_tail, Ordering::SeqCst, std::sync::atomic::Ordering::Relaxed) {
-                old_tail = lnk;
-            }
-            
-            new_tail.as_mut().unwrap().index = old_tail.as_ref().unwrap().index + 1;
-        
-            let _ = self.tail.compare_exchange(
-                old_tail, 
-                new_tail, 
-                std::sync::atomic::Ordering::SeqCst, 
-                std::sync::atomic::Ordering::Relaxed
-            );
-
-            return new_tail.as_ref().unwrap().index
+        if let Ok(_) = self.tail.compare_exchange(null_ptr, new_tail, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::Relaxed) {
+            self.head.store(new_tail, std::sync::atomic::Ordering::Relaxed);
+            return (0, entry_ptr);
         }
+
+        let mut old_tail = self.tail.load(std::sync::atomic::Ordering::Relaxed);
+        
+        while let Err(lnk) = old_tail.as_ref().unwrap().next.compare_exchange(null_ptr, new_tail, Ordering::SeqCst, std::sync::atomic::Ordering::Relaxed) {
+            old_tail = lnk;
+        }
+        
+        new_tail.as_mut().unwrap().index = old_tail.as_ref().unwrap().index + 1;
+    
+        let _ = self.tail.compare_exchange(
+            old_tail, 
+            new_tail, 
+            std::sync::atomic::Ordering::SeqCst, 
+            std::sync::atomic::Ordering::Relaxed
+        );
+
+        return (new_tail.as_ref().unwrap().index, entry_ptr)
+        
     }
 
     /// Removes the front item and returns it.

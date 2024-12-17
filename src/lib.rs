@@ -7,13 +7,12 @@ pub mod prelude {
         fn insert(&mut self, data: T) -> usize;
         
         /// Iterate over entries references in the linked list.
-        fn iter<'a>(&'a self) -> impl Iterator<Item=&T> where T: 'a;
+        fn iter<'a>(&'a self) -> super::Iter<'a, T>;
 
         /// Borrow an element in the linked-list
         fn borrow<'a>(&'a self, index: usize) -> Option<&T> where T: 'a;
     }
 }
-
 
 /// An atomic queue based on a linked-list
 pub struct AtomicQueue<T>(Arc<InnerAtomicLinkedList<T>>);
@@ -51,8 +50,8 @@ impl<T> prelude::AtomicLinkedList<T> for AtomicLinkedList<T> {
     }
 
     /// Iterate over entries references in the linked list.
-    fn iter<'a>(&'a self) -> impl Iterator<Item=&T> where T: 'a {
-        AtomicLinkIter::new(&self.0).map(|link| unsafe {&link.as_ref().data})
+    fn iter<'a>(&'a self) -> Iter<'a, T> {
+        Iter(LinkPtrIter::new(&self.0))
     }
 
     /// Borrow an element in the linked-list
@@ -75,14 +74,14 @@ impl<T> AtomicLinkedList<T> {
     /// # Unsafe
     /// Obviously because it overrides all rust-based common sense.
     pub unsafe fn get_raw_data_ptr(&self, index: usize) -> Option<NonNull<T>> {
-        AtomicLinkIter::new(&self.0).nth(index).map(|mut ptr| {
+        LinkPtrIter::new(&self.0).nth(index).map(|mut ptr| {
             NonNull::new(std::ptr::from_mut(&mut ptr.as_mut().data)).unwrap()
         })
     }
 
     /// Get a pointer to an atomic link.
     unsafe fn get_link_ptr(&self, index: usize) -> Option<NonNull<AtomicLink<T>>> {
-        AtomicLinkIter::new(&self.0).nth(index)
+        LinkPtrIter::new(&self.0).nth(index)
     }
 }
 
@@ -118,7 +117,7 @@ impl<T> prelude::AtomicLinkedList<T> for CachedAtomicLinkedList<T> {
     }
 
     /// Iterate over entries references in the linked list.
-    fn iter<'a>(&'a self) -> impl Iterator<Item=&T> where T: 'a {
+    fn iter<'a>(&'a self) -> Iter<'a, T> {
         self.inner.iter()
     }
 
@@ -137,13 +136,24 @@ impl<T> prelude::AtomicLinkedList<T> for CachedAtomicLinkedList<T> {
     }
 }
 
+pub struct Iter<'a, T>(LinkPtrIter<'a, T>);
 
-struct AtomicLinkIter<'a, T> {
+impl<'a, T: 'a> Iterator for Iter<'a, T> {
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        unsafe {
+            self.0.next().map(|entry| &entry.as_ref().data)
+        }
+    }
+}
+
+struct LinkPtrIter<'a, T> {
     _phantom: std::marker::PhantomData<&'a ()>,
     ptr: *mut AtomicLink<T>
 }
 
-impl<'a, T> AtomicLinkIter<'a, T> {
+impl<'a, T> LinkPtrIter<'a, T> {
     fn new(ll: &'a InnerAtomicLinkedList<T>) -> Self {
         Self {
             _phantom: PhantomData,
@@ -152,7 +162,7 @@ impl<'a, T> AtomicLinkIter<'a, T> {
     }
 }
 
-impl<'a, T> Iterator for AtomicLinkIter<'a, T> {
+impl<'a, T> Iterator for LinkPtrIter<'a, T> {
     type Item = NonNull<AtomicLink<T>>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -178,7 +188,7 @@ struct InnerAtomicLinkedList<T> {
 
 impl<T> Drop for InnerAtomicLinkedList<T> {
     fn drop(&mut self) {
-        AtomicLinkIter::new(self)
+        LinkPtrIter::new(self)
         .for_each(|link| unsafe {
             link.drop_in_place();
         });
